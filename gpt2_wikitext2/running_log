@@ -1,10 +1,9 @@
 # model collapse
-v2 12 6000B 1 EPOCHS=5
 
 # sensitivity
-round=0 12 6000B 0 0206101418
+round=0
 round=1
 round=3
 round=5
-round=7 54 a6000_1_2 0407101316
+round=7
 round=9
