@@ -21,7 +21,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"
 
 # 指定生成器路径 (Gen i Checkpoint)
-ROUND = 1
+ROUND = 4
 GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v2/gen_{ROUND}_model"
 
 # 模型选择
@@ -38,7 +38,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # --- 实验设置 ---
 EPOCHS = 5
 TRAIN_BATCH_SIZE = 32
-GEN_BATCH_SIZE = 64
+GEN_BATCH_SIZE = 32
 GRADIENT_ACCUMULATION = 1
 MAX_LENGTH = 1024
 PROMPT_LEN_BASE = 64
@@ -50,7 +50,8 @@ USE_FP16 = False
 
 # 为了保证 OT 计算速度，评估时最多采样多少样本计算距离
 # 注意：精确 OT (emd2) 是 O(N^3) 复杂度，N > 5000 会极慢。建议保持在 2000-5000。
-METRIC_SAMPLE_SIZE = 5000 
+OT_SAMPLE_SIZE = 5000
+FBD_SAMPLE_SIZE = 10000
 
 # ==========================================
 # 1. 实验变量组 (Sensitivity Grid)
@@ -140,7 +141,7 @@ class MetricsEvaluator:
 
     def calculate_exact_ot_distance(self, source_emb, target_emb, metric='euclidean'):
         """
-        [修改点 4] 基于 POT 库计算精确的 Optimal Transport Distance
+        基于 POT 库计算精确的 Optimal Transport Distance
         """
         # 确保数据量不要太大，否则 OOM。建议 max 5000。
         source_emb = np.array(source_emb, dtype=np.float64)
@@ -165,92 +166,147 @@ class MetricsEvaluator:
 
     def compute_fbd(self, mu1, sigma1, mu2, sigma2, eps=1e-6):
         """
-        Fréchet BERT Distance (数值稳定增强版)
+        计算 Fréchet BERT Distance (FBD) - 高精度数值稳定版
         """
-        mu1 = np.atleast_1d(mu1)
-        mu2 = np.atleast_1d(mu2)
-        sigma1 = np.atleast_2d(sigma1)
-        sigma2 = np.atleast_2d(sigma2)
+        # 1. 强制使用双精度浮点数 (float64) 以减少累积误差
+        mu1 = np.atleast_1d(mu1).astype(np.float64)
+        mu2 = np.atleast_1d(mu2).astype(np.float64)
+        sigma1 = np.atleast_2d(sigma1).astype(np.float64)
+        sigma2 = np.atleast_2d(sigma2).astype(np.float64)
 
-        assert mu1.shape == mu2.shape, "Training and test mean vectors have different lengths"
-        assert sigma1.shape == sigma2.shape, "Training and test covariances have different dimensions"
+        assert mu1.shape == mu2.shape, "Mean vectors have different lengths"
+        assert sigma1.shape == sigma2.shape, "Covariances have different dimensions"
 
+        # 2. 计算均值部分的距离 (L2-norm squared)
         diff = mu1 - mu2
+        mean_term = diff.dot(diff)
 
-        # 计算协方差乘积
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        # 3. 计算协方差部分的距离: Tr(∑1 + ∑2 - 2(∑1∑2)^(1/2))
+        # product = Sigma1 * Sigma2
+        cov_dot = sigma1.dot(sigma2)
+        
+        # 计算矩阵平方根
+        covmean, _ = linalg.sqrtm(cov_dot, disp=False)
 
-        # [优化] 检查计算失败 (NaN/Inf)
+        # [修复] 检查计算失败 (NaN/Inf) 或 奇异矩阵
         if not np.isfinite(covmean).all():
-            print(f"    | [Warning] FBD: sqrtm calculation failed (non-finite). Adding epsilon {eps}.")
+            print(f"    | [Warning] FBD: sqrtm calculation failed. Adding epsilon {eps} to diagonal.")
             offset = np.eye(sigma1.shape[0]) * eps
+            # 重新计算 (∑1 + epsI)(∑2 + epsI)
             covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
-        # [优化] 处理复数域误差
+        # [修复] 处理数值误差产生的虚部
         if np.iscomplexobj(covmean):
             # 检查虚部是否真的很小
             if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-                m = np.max(np.abs(covmean.imag))
-                # 如果虚部很大，说明分布差异极大或矩阵完全病态
-                print(f"    | [Warning] FBD: Imaginary component {m}. Metric unreliable.")
+                max_imag = np.max(np.abs(covmean.imag))
+                # 仅打印警告，不中断
+                print(f"    | [Warning] FBD: Imaginary component {max_imag}. Metric might be unreliable.")
             covmean = covmean.real
 
         tr_covmean = np.trace(covmean)
-
-        return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
+        
+        # 最终公式
+        return float(mean_term + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
 
     def run_evaluation(self, real_texts, syn_texts):
-        # 采样用于 metric 计算的子集 (防止 OT 计算爆炸)
-        if len(real_texts) > METRIC_SAMPLE_SIZE:
-            real_sample = random.sample(real_texts, METRIC_SAMPLE_SIZE)
-        else:
-            real_sample = real_texts
-            
-        if len(syn_texts) > METRIC_SAMPLE_SIZE:
-            syn_sample = random.sample(syn_texts, METRIC_SAMPLE_SIZE)
-        else:
-            syn_sample = syn_texts
+        # ==========================================
+        # 1. 动态设置采样量
+        # ==========================================
+        # FBD & Oracle Entropy: 
+        # 建议至少 10,000 条。如果为了绝对严谨，可以将 N_FBD 设置为 len(syn_texts)
+        N_FBD = min(len(real_texts), len(syn_texts), FBD_SAMPLE_SIZE) 
+        
+        # OT: 精确解计算极慢，必须控制在 2500 以内
+        N_OT = min(len(real_texts), len(syn_texts), OT_SAMPLE_SIZE)
 
-        # 1. Real Stats (Cache)
-        if self.real_stats is None:
-            print("    | [Metrics] Computing Reference (Real) Stats...")
-            emb = self.get_embeddings(real_sample)
-            ent = self.get_oracle_entropy(real_sample)
-            uni_ent = self.compute_empirical_entropy(real_sample, n=1)
-            bi_ent = self.compute_empirical_entropy(real_sample, n=2)
+        # ==========================================
+        # 2. 数据采样
+        # ==========================================
+        # A. FBD & Entropy 用的大样本
+        if len(real_texts) > N_FBD:
+            real_sample_fbd = random.sample(real_texts, N_FBD)
+        else:
+            real_sample_fbd = real_texts
             
+        if len(syn_texts) > N_FBD:
+            syn_sample_fbd = random.sample(syn_texts, N_FBD)
+        else:
+            syn_sample_fbd = syn_texts
+
+        # ==========================================
+        # 3. 计算 Real Stats (缓存)
+        # ==========================================
+        if self.real_stats is None or self.real_stats["n_samples"] < N_FBD:
+            print(f"    | [Metrics] Computing Real Stats (N={N_FBD})...")
+            
+            real_emb_fbd = self.get_embeddings(real_sample_fbd)
+            
+            # [修改点] Real Oracle Entropy: 改用大样本 (N_FBD) 计算
+            real_oracle_ent = self.get_oracle_entropy(real_sample_fbd) 
+            
+            # Real N-gram Entropy: 用采样的大样本 (N=10000 足够稳定)
+            real_uni_ent = self.compute_empirical_entropy(real_sample_fbd, n=1)
+            real_bi_ent = self.compute_empirical_entropy(real_sample_fbd, n=2)
+            
+            real_mu = np.mean(real_emb_fbd, axis=0)
+            real_cov = np.cov(real_emb_fbd, rowvar=False)
+
             self.real_stats = {
-                "emb": emb, 
-                "mu": np.mean(emb, axis=0), 
-                "cov": np.cov(emb, rowvar=False), 
-                "ent": ent,
-                "uni": uni_ent, 
-                "bi": bi_ent
+                "emb": real_emb_fbd,
+                "mu": real_mu,
+                "cov": real_cov,
+                "ent": real_oracle_ent,
+                "uni": real_uni_ent,
+                "bi": real_bi_ent,
+                "n_samples": len(real_sample_fbd)
             }
+        else:
+            print("    | [Metrics] Using cached Real Stats.")
+
+        # ==========================================
+        # 4. 计算 Synthetic Stats
+        # ==========================================
+        print(f"    | [Metrics] Computing Synthetic Stats (N={N_FBD})...")
         
-        # 2. Syn Stats
-        print("    | [Metrics] Computing Synthetic Stats...")
-        syn_emb = self.get_embeddings(syn_sample)
-        syn_ent = self.get_oracle_entropy(syn_sample)
-        syn_uni = self.compute_empirical_entropy(syn_texts, n=1) # 经验熵可以用全量算，很快
-        syn_bi = self.compute_empirical_entropy(syn_texts, n=2)
+        syn_emb_fbd = self.get_embeddings(syn_sample_fbd)
+        syn_mu = np.mean(syn_emb_fbd, axis=0)
+        syn_cov = np.cov(syn_emb_fbd, rowvar=False)
         
-        syn_mu = np.mean(syn_emb, axis=0)
-        syn_cov = np.cov(syn_emb, rowvar=False)
+        # [修改点] Synthetic Oracle Entropy: 改用大样本 (N_FBD)
+        # 既然 N_FBD 已经是 10,000 条级别，这在统计上和全量没有区别，但比全量快
+        syn_oracle_ent = self.get_oracle_entropy(syn_sample_fbd)
         
-        # 3. Distances
-        print("    | [Metrics] Calculating Distances (FBD & Exact OT)...")
-        fbd = self.compute_fbd(self.real_stats['mu'], self.real_stats['cov'], syn_mu, syn_cov)
-        ot_dist = self.calculate_exact_ot_distance(self.real_stats['emb'], syn_emb, metric='euclidean')
+        # [保持原样] Synthetic N-gram: 只要计算极快，永远建议用全量 (syn_texts)
+        syn_uni_ent = self.compute_empirical_entropy(syn_texts, n=1) 
+        syn_bi_ent = self.compute_empirical_entropy(syn_texts, n=2)
+
+        # ==========================================
+        # 5. 计算距离
+        # ==========================================
+        print(f"    | [Metrics] Calculating FBD (using {N_FBD} samples)...")
+        fbd_score = self.compute_fbd(
+            self.real_stats['mu'], self.real_stats['cov'], 
+            syn_mu, syn_cov
+        )
+        
+        print(f"    | [Metrics] Calculating Exact OT (using subset {N_OT})...")
+        # OT 依然必须切片，否则跑不完
+        real_emb_ot = self.real_stats['emb'][:N_OT]
+        syn_emb_ot = syn_emb_fbd[:N_OT]
+        
+        ot_dist = self.calculate_exact_ot_distance(
+            real_emb_ot, syn_emb_ot, metric='euclidean'
+        )
         
         return {
-            "oracle_entropy": float(syn_ent),
-            "empirical_unigram_entropy": float(syn_uni),
-            "empirical_bigram_entropy": float(syn_bi),
-            "fbd_score": fbd,
-            "exact_ot_distance": ot_dist,
-            # Refs
-            "ref_bigram_entropy": self.real_stats['bi']
+            "oracle_entropy": float(syn_oracle_ent),
+            "empirical_unigram_entropy": float(syn_uni_ent),
+            "empirical_bigram_entropy": float(syn_bi_ent),
+            "fbd_score": float(fbd_score),
+            "exact_ot_distance": float(ot_dist),
+            "ref_oracle_entropy": float(self.real_stats['ent']),
+            "ref_bigram_entropy": float(self.real_stats['bi'])
         }
 
 # ==========================================
