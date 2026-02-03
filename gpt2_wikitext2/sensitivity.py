@@ -21,7 +21,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"
 
 # 指定生成器路径 (Gen i Checkpoint)
-ROUND = 1
+ROUND = 9
 GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v1/gen_{ROUND}_model"
 
 # 模型选择
@@ -55,7 +55,7 @@ METRIC_SAMPLE_SIZE = 5000
 # ==========================================
 # 1. 实验变量组 (Sensitivity Grid)
 # ==========================================
-TEMPERATURES = [0.5, 0.75, 1.0, 1.25, 1.75]
+TEMPERATURES = [0.4, 0.7, 1.0, 1.3, 1.6]
 SENSITIVITY_CONFIGS = [
     {"name": f"Temp_{t}", "temp": t, "top_k": 50, "top_p": 0.95} 
     for t in TEMPERATURES
