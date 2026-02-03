@@ -21,7 +21,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"
 
 # 指定生成器路径 (Gen i Checkpoint)
-ROUND = 3
+ROUND = 4
 GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v2/gen_{ROUND}_model"
 
 # 模型选择
