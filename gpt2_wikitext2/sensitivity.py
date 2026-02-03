@@ -21,8 +21,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"
 
 # 指定生成器路径 (Gen i Checkpoint)
-ROUND = 9
-GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v1/gen_{ROUND}_model"
+ROUND = 1
+GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v2/gen_{ROUND}_model"
 
 # 模型选择
 # 用于训练的学生模型底座 (Fresh Base)
@@ -36,7 +36,7 @@ RESULT_ROOT = f"sensitivity_analysis/round_{ROUND+1}"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 实验设置 ---
-EPOCHS = 5    
+EPOCHS = 5
 TRAIN_BATCH_SIZE = 32
 GEN_BATCH_SIZE = 64
 GRADIENT_ACCUMULATION = 1
@@ -55,7 +55,7 @@ METRIC_SAMPLE_SIZE = 5000
 # ==========================================
 # 1. 实验变量组 (Sensitivity Grid)
 # ==========================================
-TEMPERATURES = [0.4, 0.7, 1.0, 1.3, 1.6]
+TEMPERATURES = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
 SENSITIVITY_CONFIGS = [
     {"name": f"Temp_{t}", "temp": t, "top_k": 50, "top_p": 0.95} 
     for t in TEMPERATURES
@@ -165,49 +165,39 @@ class MetricsEvaluator:
 
     def compute_fbd(self, mu1, sigma1, mu2, sigma2, eps=1e-6):
         """
-        计算 Fréchet BERT Distance (FBD) - 数值稳定优化版
-        Args:
-            mu1, mu2: 均值向量
-            sigma1, sigma2: 协方差矩阵
-            eps: 防止 sqrtm 失败的微小扰动项
+        Fréchet BERT Distance (数值稳定增强版)
         """
-        # 1. 强制使用 float64 以保证精度
-        mu1 = np.atleast_1d(mu1).astype(np.float64)
-        mu2 = np.atleast_1d(mu2).astype(np.float64)
-        sigma1 = np.atleast_2d(sigma1).astype(np.float64)
-        sigma2 = np.atleast_2d(sigma2).astype(np.float64)
+        mu1 = np.atleast_1d(mu1)
+        mu2 = np.atleast_1d(mu2)
+        sigma1 = np.atleast_2d(sigma1)
+        sigma2 = np.atleast_2d(sigma2)
 
-        # 2. 计算均值部分的距离
+        assert mu1.shape == mu2.shape, "Training and test mean vectors have different lengths"
+        assert sigma1.shape == sigma2.shape, "Training and test covariances have different dimensions"
+
         diff = mu1 - mu2
-        mean_term = diff.dot(diff)
 
-        # 3. 计算协方差部分的距离: Tr(∑1 + ∑2 - 2(∑1∑2)^(1/2))
-        # product = Sigma1 * Sigma2
-        cov_dot = sigma1.dot(sigma2)
-        
-        # 计算矩阵平方根
-        covmean, _ = linalg.sqrtm(cov_dot, disp=False)
+        # 计算协方差乘积
+        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
 
-        # 4. [关键优化] 处理奇异矩阵导致的 sqrtm 失败
-        # 如果 cov_dot 是奇异的，sqrtm 可能会返回无穷大或 NaN
+        # [优化] 检查计算失败 (NaN/Inf)
         if not np.isfinite(covmean).all():
-            print(f"    | [Warning] FBD: Singular product encountered, adding epsilon {eps} to diagonal.")
+            print(f"    | [Warning] FBD: sqrtm calculation failed (non-finite). Adding epsilon {eps}.")
             offset = np.eye(sigma1.shape[0]) * eps
-            # 重新计算 (∑1 + epsI)(∑2 + epsI)
             covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
-        # 5. 处理数值误差产生的虚部
+        # [优化] 处理复数域误差
         if np.iscomplexobj(covmean):
             # 检查虚部是否真的很小
             if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-                max_imag = np.max(np.abs(covmean.imag))
-                print(f"    | [Warning] FBD: Large imaginary component {max_imag}. Metric might be unreliable.")
+                m = np.max(np.abs(covmean.imag))
+                # 如果虚部很大，说明分布差异极大或矩阵完全病态
+                print(f"    | [Warning] FBD: Imaginary component {m}. Metric unreliable.")
             covmean = covmean.real
 
-        # trace term
         tr_covmean = np.trace(covmean)
-        
-        return float(mean_term + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
+
+        return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
 
     def run_evaluation(self, real_texts, syn_texts):
         # 采样用于 metric 计算的子集 (防止 OT 计算爆炸)
@@ -330,7 +320,7 @@ def train_one_round(config_name, train_dataset, tokenizer):
     """
     训练函数：只保存训练结束后的最终模型 (Last Checkpoint)。
     """
-    output_dir = os.path.join(RESULT_ROOT, config_name, "model")
+    # output_dir = os.path.join(RESULT_ROOT, config_name, "model")
 
     print(f"    | [Train] Initializing FRESH Base Model from {BASE_MODEL_PATH}...")
     model = GPT2LMHeadModel.from_pretrained(BASE_MODEL_PATH).to(DEVICE)
@@ -347,8 +337,8 @@ def train_one_round(config_name, train_dataset, tokenizer):
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     training_args = TrainingArguments(
-        output_dir=output_dir,
-        overwrite_output_dir=True,
+        # output_dir=output_dir,
+        # overwrite_output_dir=True,
         num_train_epochs=EPOCHS,
         per_device_train_batch_size=TRAIN_BATCH_SIZE, 
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
