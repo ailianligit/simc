@@ -1,11 +1,11 @@
 # model collapse
 
 # sensitivity
-round=0 12 4090_4_1 genbatch=32 trainbatch=8 accstep=4
+round=0 53
 
 round=4 12 6000b_0_2 genbatch=64 trainbatch=8 accstep=4
-round=5 12 6000b_1_2 genbatch=32 trainbatch=8 accstep=4
+round=5 12
 round=6 54 a6000_0_1 genbatch=32 trainbatch=8 accstep=4
 round=7 54 a6000_1_1 genbatch=32 trainbatch=8 accstep=4
 round=8 12 6000b_1_1 genbatch=64 trainbatch=8 accstep=4
-round=9 54 4090_5_1 genbatch=32 trainbatch=8 accstep=4
+round=9 53
