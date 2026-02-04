@@ -37,7 +37,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 实验设置 ---
 EPOCHS = 5
-TRAIN_BATCH_SIZE = 8
+TRAIN_BATCH_SIZE = 4
 GEN_BATCH_SIZE = 32
 GRADIENT_ACCUMULATION = 4
 MAX_LENGTH = 1024

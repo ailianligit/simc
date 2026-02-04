@@ -8,4 +8,4 @@ round=5 12 6000b_1_2 genbatch=32 trainbatch=8 accstep=4
 round=6 54 a6000_0_1 genbatch=32 trainbatch=8 accstep=4
 round=7 54 a6000_1_1 genbatch=32 trainbatch=8 accstep=4
 round=8 12 6000b_1_1 genbatch=64 trainbatch=8 accstep=4
-round=9
+round=9 54 5090_2_1 genbatch=32 trainbatch=4 accstep=4
