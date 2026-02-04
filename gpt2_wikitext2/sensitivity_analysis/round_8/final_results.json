@@ -68,5 +68,33 @@
         "ref_oracle_entropy": 3.5910967597583356,
         "ref_bigram_entropy": 11.364064207960974,
         "validation_ppl": 40.23550796508789
+    },
+    {
+        "name": "Temp_1.2",
+        "temp": 1.2,
+        "top_k": 50,
+        "top_p": 0.95,
+        "oracle_entropy": 1.4733014762982726,
+        "empirical_unigram_entropy": 6.8822805466337895,
+        "empirical_bigram_entropy": 10.677796045289412,
+        "fbd_score": 0.41119873287223174,
+        "exact_ot_distance": 1.0624909891341634,
+        "ref_oracle_entropy": 3.5910967597583356,
+        "ref_bigram_entropy": 11.364064207960974,
+        "validation_ppl": 33.96353530883789
+    },
+    {
+        "name": "Temp_1.4",
+        "temp": 1.4,
+        "top_k": 50,
+        "top_p": 0.95,
+        "oracle_entropy": 1.8219077857688069,
+        "empirical_unigram_entropy": 6.977145497291967,
+        "empirical_bigram_entropy": 10.96613627100715,
+        "fbd_score": 0.4116321448191582,
+        "exact_ot_distance": 1.071194126570392,
+        "ref_oracle_entropy": 3.5910967597583356,
+        "ref_bigram_entropy": 11.364064207960974,
+        "validation_ppl": 30.770931243896484
     }
 ]
