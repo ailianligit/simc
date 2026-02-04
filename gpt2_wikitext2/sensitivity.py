@@ -541,10 +541,27 @@ def main():
     # 3. 初始化评估器 (包含 MPNet 和 GPT2-Large)
     evaluator = MetricsEvaluator(DEVICE)
     
+    # ==========================================
+    results_path = os.path.join(RESULT_ROOT, "final_results.json")
     results = []
+    finished_experiments = set()
+
+    if os.path.exists(results_path):
+        try:
+            with open(results_path, "r") as f:
+                results = json.load(f)
+            # 提取已经完成的实验名称 (比如 "Temp_0.2")
+            finished_experiments = {item["name"] for item in results}
+            print(f">>> [Resume] Found {len(results)} completed experiments: {finished_experiments}")
+        except json.JSONDecodeError:
+            print(">>> [Warning] Results file exists but is corrupted/empty. Starting fresh.")
 
     # 4. 实验循环
     for exp_cfg in SENSITIVITY_CONFIGS:
+        if exp_cfg["name"] in finished_experiments:
+            print(f"\n================ Skipping: {exp_cfg['name']} (Already Done) ================")
+            continue
+
         print(f"\n================ Running: {exp_cfg['name']} ================")
         
         # A. 全量生成
@@ -569,9 +586,12 @@ def main():
         # E. 保存
         record = {**exp_cfg, **data_metrics, "validation_ppl": ppl}
         results.append(record)
-        
-        with open(os.path.join(RESULT_ROOT, "final_results.json"), "w") as f:
+
+        # 为了防止写入时崩溃导致文件损坏，建议先写临时文件再重命名 (Atomic Write)
+        temp_path = results_path + ".tmp"
+        with open(temp_path, "w") as f:
             json.dump(results, f, indent=4)
+        os.replace(temp_path, results_path)
             
         # 清理
         del student_model, syn_dataset
