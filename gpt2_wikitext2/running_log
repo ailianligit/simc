@@ -5,9 +5,9 @@ round=0 12 6000b_0_1 genbatch=64
 round=1 12 6000b_1_1 genbatch=64
 round=2 54 a6000_0_1 genbatch=32 trainbatch=8 accstep=4
 round=3 54 a6000_1_1 genbatch=32 trainbatch=8 accstep=4
-round=4 54 5090_2_1 genbatch=32 trainbatch=8 accstep=4
-round=5 53 4090_4_1 genbatch=32 trainbatch=8 accstep=4
-round=6 53 4090_5_1 genbatch=32 trainbatch=8 accstep=4
-round=7 53 4090_6_1 genbatch=32 trainbatch=8 accstep=4
-round=8 53 4090_7_1 genbatch=32 trainbatch=8 accstep=4
-round=9 53 4090_3_1 genbatch=32 trainbatch=8 accstep=4
+round=4
+round=5
+round=6
+round=7
+round=8
+round=9
