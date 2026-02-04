@@ -3,11 +3,11 @@
 # sensitivity
 round=0 12 6000b_0_1 genbatch=32 trainbatch=8 accstep=4
 round=1 12 6000b_1_1 genbatch=64
-round=2 54 a6000_0_1 genbatch=32 trainbatch=8 accstep=4
-round=3 54 a6000_1_1 genbatch=32 trainbatch=8 accstep=4
+
+
 round=4 12 6000b_0_2 genbatch=64 trainbatch=8 accstep=4
 round=5 12 6000b_1_2 genbatch=32 trainbatch=8 accstep=4
-round=6
-round=7
+round=6 54 a6000_0_1 genbatch=32 trainbatch=8 accstep=4
+round=7 54 a6000_1_1 genbatch=32 trainbatch=8 accstep=4
 round=8
 round=9

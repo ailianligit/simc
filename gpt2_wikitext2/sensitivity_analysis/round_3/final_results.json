@@ -124,5 +124,19 @@
         "ref_oracle_entropy": 3.5910967597583356,
         "ref_bigram_entropy": 11.364064207960974,
         "validation_ppl": 27.737165451049805
+    },
+    {
+        "name": "Temp_2.0",
+        "temp": 2.0,
+        "top_k": 50,
+        "top_p": 0.95,
+        "oracle_entropy": 3.546758398592472,
+        "empirical_unigram_entropy": 7.582709040915429,
+        "empirical_bigram_entropy": 12.66595201473963,
+        "fbd_score": 0.44224141512607984,
+        "exact_ot_distance": 1.1040755803444224,
+        "ref_oracle_entropy": 3.5910967597583356,
+        "ref_bigram_entropy": 11.364064207960974,
+        "validation_ppl": 27.75425148010254
     }
 ]
