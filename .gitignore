@@ -1,6 +1,7 @@
 gpt2_wikitext2/model_collapse_results_v1
 gpt2_wikitext2/model_collapse_results_v2
 gpt2_wikitext2/model_real_trained
+gpt2_wikitext2/rejection_sampling_results
 
 *.safetensors
 *.bin

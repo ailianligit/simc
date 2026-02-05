@@ -1,10 +1,7 @@
 # model collapse
 
 # sensitivity
-round=0 12 6000b_0_1 genbatch=64 trainbatch=8 accstep=4
 
-round=5 12 6000b_1_1 genbatch=64 trainbatch=8 accstep=4
-round=6 54 a6000_0_1 genbatch=32 trainbatch=8 accstep=4
-round=7 54 a6000_1_1 genbatch=32 trainbatch=8 accstep=4
-round=8 12 6000b_1_1 genbatch=64 trainbatch=8 accstep=4
-round=9 50 a6000_7_1 genbatch=32 trainbatch=8 accstep=4
+# reject sampling
+REJECT 12-6000b 6000b-0-1
+BASELINE 12-6000b 6000b-1-1
