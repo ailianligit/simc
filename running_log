@@ -1,7 +1,7 @@
 # model collapse
+v3 12-6000b 6000b-0-1 current_max_target = min(max(batch_lens) + 512, MAX_LENGTH)
 
 # sensitivity
+v2 12-6000b 6000b-0-1 ROUND = 0
 
 # reject sampling
-REJECT 12-6000b 6000b-0-1
-BASELINE 12-6000b 6000b-1-1

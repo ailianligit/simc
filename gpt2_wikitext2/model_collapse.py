@@ -23,7 +23,7 @@ from transformers import (
 # 路径设置 (请根据你的实际环境修改这些路径)
 DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"  # 原始真实数据路径
 MODEL_PATH = "/home/ubuntu/data/model/gpt2_model"        # 原始 GPT-2 权重路径
-EXPERIMENT_ROOT = "./model_collapse_results_v2"             # 实验结果输出目录
+EXPERIMENT_ROOT = "./model_collapse_results_v3"             # 实验结果输出目录
 
 # 硬件定义 (必须在函数定义之前)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -162,7 +162,7 @@ def generate_synthetic_data(model, tokenizer, prompt_dataset, num_samples,
         # 估算长度
         batch_lens = [len(t) for t in tokenizer(batch_prompts, add_special_tokens=False)["input_ids"]]
         # 动态长度：保持与原文本长度分布一致
-        current_max_target = min(max(batch_lens) + 128, MAX_LENGTH)
+        current_max_target = min(max(batch_lens) + 512, MAX_LENGTH)
 
         # 截断 Prompt
         inputs = tokenizer(
