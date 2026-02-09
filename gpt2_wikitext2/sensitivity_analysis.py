@@ -25,10 +25,12 @@ DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"
 BASE_MODEL_PATH = "/home/ubuntu/data/model/gpt2_model" 
 EMBEDDING_MODEL_PATH = "/home/ubuntu/data/model/all-mpnet-base-v2"
 
-# [关键修改] 指定由第一份代码训练出的 Gen 0 模型路径 (真实数据训练的模型)
-# 如果找不到这个路径，脚本会自动回退到使用 gpt2-large (但强烈建议使用 Gen 0)
-REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
-FALLBACK_ENTROPY_MODEL = "gpt2-large"
+# [配置 1] Entropy 的裁判：必须是领域专家 (Gen 0)
+REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results/gen_0_oracle"
+
+# [配置 2] MAUVE 的特征提取器：使用更聪明的模型 (GPT-2 Large)
+# 指向你本地的 gpt2-large 路径
+MAUVE_MODEL_PATH = "/home/ubuntu/data/model/gpt2_large"
 
 # 指定要分析的生成器路径 (Gen i Checkpoint)
 ROUND = 0
@@ -71,20 +73,25 @@ class MetricsEvaluator:
         self.device = device
         self.embedding_path = embedding_path
         
-        # 自动决定使用哪个模型作为 Oracle
+        # 1. 设置 Entropy Oracle (Gen 0)
         if os.path.exists(REAL_DATA_MODEL_PATH):
-            print(f">>> [Metrics] Using Real Data Model (Gen 0) as Oracle: {REAL_DATA_MODEL_PATH}")
+            print(f">>> [Metrics] Entropy Oracle: Using Gen 0 from {REAL_DATA_MODEL_PATH}")
             self.entropy_path = REAL_DATA_MODEL_PATH
         else:
-            print(f">>> [Metrics] Gen 0 not found. Fallback to generic Oracle: {FALLBACK_ENTROPY_MODEL}")
-            self.entropy_path = FALLBACK_ENTROPY_MODEL
-        
-        # [关键设计] 初始化时不加载模型，防止占用显存
+            print(f">>> [Metrics] Gen 0 not found. Fallback to gpt2-large.")
+            self.entropy_path = "gpt2-large" # 在线回退
+            
+        # [新增] 设置 MAUVE Featurizer (GPT-2 Large)
+        # 如果你有本地的 gpt2-large，在这里指定路径
+        print(f">>> [Metrics] MAUVE Featurizer: Using local GPT-2 Large from {MAUVE_MODEL_PATH}")
+        self.mauve_path = MAUVE_MODEL_PATH
+
+        # 初始化状态
         self.embed_model = None
         self.entropy_model = None
         self.entropy_tokenizer = None
         self.nll_loss_fct = CrossEntropyLoss(reduction='none')
-        self.real_stats = None 
+        self.real_stats = None
 
     # --- 显存管理方法 ---
     def _load_embed_model(self):
@@ -208,8 +215,8 @@ class MetricsEvaluator:
         return float(mean_term + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
 
     def compute_mauve(self, real_texts, syn_texts, max_samples=10000):
-        """MAUVE 计算 (显存敏感)"""
-        # 强制卸载其他模型
+        """MAUVE 计算 (使用 GPT-2 Large)"""
+        # [关键] 强制卸载其他模型，腾出显存给 GPT-2 Large
         self._unload_embed_model()
         self._unload_entropy_model()
         
@@ -219,16 +226,21 @@ class MetricsEvaluator:
 
         try:
             out = mauve.compute_mauve(
-                p_text=p_text, q_text=q_text,
+                p_text=p_text, 
+                q_text=q_text,
                 device_id=0 if self.device == 'cuda' else -1,
-                max_text_length=MAX_LENGTH, verbose=False,
-                featurize_model_name="gpt2-large"
+                max_text_length=MAX_LENGTH, 
+                verbose=False,
+                # [修改点] 不要写死 "gpt2-large"，改用 self.mauve_path
+                # 并且要确保你在 __init__ 中定义了 self.mauve_path
+                featurize_model_name=self.mauve_path 
             )
             score = out.mauve
         except Exception as e:
             print(f"    | [Warning] MAUVE failed: {e}")
             score = -1.0
         
+        # 计算完自动清理，mauve 库内部会释放显存，但我们显式调用一次更安全
         torch.cuda.empty_cache()
         return score
 
