@@ -27,12 +27,12 @@ EMBEDDING_MODEL_PATH = "/home/ubuntu/data/model/all-mpnet-base-v2"
 
 # [关键修改] 指定由第一份代码训练出的 Gen 0 模型路径 (真实数据训练的模型)
 # 如果找不到这个路径，脚本会自动回退到使用 gpt2-large (但强烈建议使用 Gen 0)
-REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results"
+REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
 FALLBACK_ENTROPY_MODEL = "gpt2-large"
 
 # 指定要分析的生成器路径 (Gen i Checkpoint)
 ROUND = 0
-GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v2/gen_{ROUND}_model"
+GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v3/gen_{ROUND}_model"
 
 RESULT_ROOT = f"sensitivity_analysis_results_v2/round_{ROUND+1}"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
