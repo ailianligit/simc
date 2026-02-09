@@ -26,14 +26,14 @@ BASE_MODEL_PATH = "/home/ubuntu/data/model/gpt2_model"
 EMBEDDING_MODEL_PATH = "/home/ubuntu/data/model/all-mpnet-base-v2"
 
 # [配置 1] Entropy 的裁判：必须是领域专家 (Gen 0)
-REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results/gen_0_oracle"
+REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
 
 # [配置 2] MAUVE 的特征提取器：使用更聪明的模型 (GPT-2 Large)
 # 指向你本地的 gpt2-large 路径
 MAUVE_MODEL_PATH = "/home/ubuntu/data/model/gpt2_large"
 
 # 指定要分析的生成器路径 (Gen i Checkpoint)
-ROUND = 0
+ROUND = 9
 GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v3/gen_{ROUND}_model"
 
 RESULT_ROOT = f"sensitivity_analysis_results_v2/round_{ROUND+1}"
