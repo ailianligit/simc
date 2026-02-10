@@ -33,7 +33,7 @@ REAL_DATA_MODEL_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained
 MAUVE_MODEL_PATH = "/home/ubuntu/data/model/gpt2_large"
 
 # 指定要分析的生成器路径 (Gen i Checkpoint)
-ROUND = 9
+ROUND = 8
 GENERATOR_PATH = f"/home/ubuntu/data/simc/gpt2_wikitext2/model_collapse_results_v3/gen_{ROUND}_model"
 
 RESULT_ROOT = f"sensitivity_analysis_results_v2/round_{ROUND+1}"
