@@ -2,6 +2,6 @@
 
 # sensitivity
 v2 12-6000b 6000b-0-1 ROUND = 3
-v2 12-6000b 6000b-1-1 ROUND = 7
+v2 12-6000b 6000b-1-1 ROUND = 6
 
 # reject sampling
