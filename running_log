@@ -1,7 +1,11 @@
 # model collapse
 
 # sensitivity
-v2 12-6000b 6000b-0-1 ROUND = 4
-v2 12-6000b 6000b-1-1 ROUND = 5
 
-# reject sampling
+# reject sampling v1
+
+# reject sampling v2
+reject_v2.sh 6000b_0_1 
+
+# reject sampling v3
+reject_v3.sh 6000b_1_1
