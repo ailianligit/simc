@@ -7,6 +7,8 @@ gpt2_wikitext2/sensitivity_analysis_results_v2
 gpt2_wikitext2/rejection_sampling_results_v1
 gpt2_wikitext2/rejection_sampling_results_v2
 gpt2_wikitext2/rejection_sampling_results_v3
+gpt2_wikitext2/rejection_sampling_results_v4
+gpt2_wikitext2/rejection_sampling_results_v5
 
 *.safetensors
 *.bin

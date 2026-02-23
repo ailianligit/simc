@@ -33,12 +33,12 @@ GEN0_ORACLE_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
 NUM_GENERATIONS = 10
 EPOCHS = 5
 TARGET_SAMPLES = 10000       # 最终用于训练的精选数据量
-OVERSAMPLE_RATIO = 2.0      # 候选池放大倍数 (生成 20000 条供筛选)
+OVERSAMPLE_RATIO = 2.0       # 候选池放大倍数 (生成 20000 条供筛选)
 
-GEN_BATCH_SIZE = 256
-TRAIN_BATCH_SIZE = 32
-GRADIENT_ACCUMULATION = 1
-GEN_TEMPERATURE = 1.3       # 较高温度，注入必要方差
+GEN_BATCH_SIZE = 128
+TRAIN_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION = 2
+GEN_TEMPERATURE = 1.3        # 较高温度，注入必要方差
 PROMPT_LEN_BASE = 64
 
 # ==========================================
@@ -90,16 +90,6 @@ class AdvancedRejectionSampler:
             gc.collect()
             torch.cuda.empty_cache()
 
-    # --- 特征提取计算 ---
-    @staticmethod
-    def compute_bigram_entropy(text):
-        tokens = text.strip().split()
-        if len(tokens) < 2: return 0.0
-        bigrams = list(zip(tokens[:-1], tokens[1:]))
-        counts = Counter(bigrams)
-        total = len(bigrams)
-        return -sum((c/total) * math.log(c/total) for c in counts.values())
-
     def get_batch_oracle_nll(self, texts, batch_size=32):
         self._load_oracle()
         nlls = []
@@ -149,69 +139,88 @@ class AdvancedRejectionSampler:
             selected = random.sample(candidate_texts, target_size)
             return selected, {}
 
-        # 1. 基础 DataFrame 初始化
         df = pd.DataFrame({"text": candidate_texts})
 
         # ==========================================
-        # 阶段 A: 微观特征过滤 (Micro-Level Filtering)
+        # 阶段 A: 微观动态截断 (Fluency First 硬安检)
         # ==========================================
         if strategy in ["micro_only", "combined"]:
-            print("    | Running Micro-Level Profiling...")
+            print("    | Running Dynamic Micro-Level Profiling...")
             df['nll'] = self.get_batch_oracle_nll(candidate_texts)
-            df['bi_ent'] = [self.compute_bigram_entropy(t) for t in candidate_texts]
             
-            # 宽泛截断 (保留中间 70% 的数据，剔除极端异常值)
-            ent_thresh = df['bi_ent'].quantile(0.15) # 防模式崩溃
-            nll_thresh = df['nll'].quantile(0.85)    # 防幻觉乱码
+            # [改进点 1&2]: 移除 Entropy 下限，改用 NLL 的动态相对阈值
+            nll_mean = df['nll'].mean()
+            nll_std = df['nll'].std()
+            # 只砍掉当前代最差的那些幻觉样本 (NLL 过高)
+            dynamic_thresh = nll_mean + 1.5 * nll_std
             
-            valid_df = df[(df['bi_ent'] >= ent_thresh) & (df['nll'] <= nll_thresh)].copy()
+            valid_df = df[df['nll'] <= dynamic_thresh].copy()
+            print(f"    | Dynamic NLL Cutoff: {dynamic_thresh:.2f} (Kept {len(valid_df)}/{len(df)})")
             
-            # 兜底机制：如果过滤太狠，按综合质量分补齐
             if len(valid_df) < target_size:
-                print(f"    | [Warning] Valid pool too small ({len(valid_df)}). Padding...")
+                print("    | [Warning] Valid pool too small. Padding with best remaining NLL.")
                 missing = target_size - len(valid_df)
                 remaining = df.drop(valid_df.index).copy()
-                remaining['score'] = remaining['bi_ent'] - remaining['nll']
-                pad_df = remaining.nlargest(missing, 'score')
+                pad_df = remaining.nsmallest(missing, 'nll')
                 candidate_df = pd.concat([valid_df, pad_df])
             else:
-                # 即使充裕，我们也需要保留足够的候选供宏观搜索，至少保留 target_size * 1.2
-                search_pool_size = max(target_size, int(target_size * 1.2))
-                candidate_df = valid_df.sample(min(len(valid_df), search_pool_size), random_state=42)
+                candidate_df = valid_df
         else:
             candidate_df = df # macro_only 不做微观过滤
 
         if strategy == "micro_only":
             final_df = candidate_df.sample(target_size, random_state=42)
-            return final_df['text'].tolist(), {"nll_mean": final_df['nll'].mean(), "bi_ent_mean": final_df['bi_ent'].mean()}
+            return final_df['text'].tolist(), {"nll_mean": final_df['nll'].mean()}
 
         # ==========================================
-        # 阶段 B: 宏观分布搜索 (Macro-Level Coreset Selection)
+        # 阶段 B: 正则化 FBD 宏观搜索 (Regularized FBD)
         # ==========================================
         if strategy in ["macro_only", "combined"]:
-            print("    | Running Macro-Level FBD Subset Search...")
+            print("    | Running Macro-Level Regularized FBD Search...")
             pool_texts = candidate_df['text'].tolist()
             pool_embs = self.get_embeddings(pool_texts)
             
-            best_idx = None
-            best_fbd = float('inf')
-            num_trials = 15 # 蒙特卡洛搜索次数
+            # 如果是 combined，我们需要知道每个样本的 NLL 来计算惩罚项
+            # 如果是 macro_only，我们只关心 FBD，不惩罚 NLL
+            if strategy == "combined":
+                pool_nlls = candidate_df['nll'].values
             
-            for _ in tqdm(range(num_trials), desc="    | Searching best FBD subset", leave=False):
+            best_idx = None
+            best_score = float('inf')
+            best_raw_fbd = 0
+            num_trials = 20 # 蒙特卡洛搜索次数
+            
+            # [改进点 3]: NLL 惩罚系数 (Lambda)
+            # FBD 通常在 0.05 ~ 0.3 之间，NLL 通常在 3.0 ~ 5.0 之间
+            # 我们希望 NLL 每增加 0.1，就相当于 FBD 恶化了 0.05，因此 lambda 设为 0.5 较为合理
+            LAMBDA_NLL = 0.5 
+            
+            for _ in tqdm(range(num_trials), desc="    | Searching Subsets", leave=False):
                 subset_idx = np.random.choice(len(pool_embs), target_size, replace=False)
                 sub_embs = pool_embs[subset_idx]
                 sub_mu = np.mean(sub_embs, axis=0)
                 sub_cov = np.cov(sub_embs, rowvar=False)
                 
-                fbd = self.compute_fbd(self.real_mu, self.real_cov, sub_mu, sub_cov)
-                if fbd < best_fbd:
-                    best_fbd = fbd
+                raw_fbd = self.compute_fbd(self.real_mu, self.real_cov, sub_mu, sub_cov)
+                
+                if strategy == "combined":
+                    subset_mean_nll = np.mean(pool_nlls[subset_idx])
+                    # 正则化打分公式：FBD 越低越好，均值 NLL 越低越好
+                    current_score = raw_fbd + LAMBDA_NLL * subset_mean_nll
+                else:
+                    current_score = raw_fbd # macro_only 退化为只看 FBD
+                
+                if current_score < best_score:
+                    best_score = current_score
+                    best_raw_fbd = raw_fbd
                     best_idx = subset_idx
                     
             selected_texts = [pool_texts[i] for i in best_idx]
-            stats = {"fbd_score": best_fbd}
+            
+            stats = {"fbd_score": best_raw_fbd, "combined_score": best_score}
             if strategy == "combined":
                 stats["nll_mean"] = candidate_df.iloc[best_idx]['nll'].mean()
+                
             return selected_texts, stats
 
 # ==========================================
@@ -221,7 +230,6 @@ def train_model(texts, tokenizer, output_dir):
     model = GPT2LMHeadModel.from_pretrained(BASE_MODEL_PATH).to(DEVICE)
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Data Packing
     ds = Dataset.from_dict({"text": texts})
     tok_ds = ds.map(lambda x: tokenizer([t + tokenizer.eos_token for t in x["text"]]), batched=True, remove_columns=["text"])
     
@@ -278,26 +286,23 @@ def main():
     parser.add_argument("--strategy", type=str, choices=["baseline", "micro_only", "macro_only", "combined"], required=True)
     args = parser.parse_args()
 
-    # 固定随机种，确保 Baseline 和策略组的初始 Prompt 是相同的
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
 
-    EXP_DIR = f"./rejection_sampling_results_v2/exp_{args.strategy}"
+    EXP_DIR = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v4/exp_{args.strategy}"
     os.makedirs(EXP_DIR, exist_ok=True)
     metrics_log = os.path.join(EXP_DIR, "metrics.json")
     
     tokenizer = GPT2Tokenizer.from_pretrained(BASE_MODEL_PATH)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # 加载数据
     try: ds = load_from_disk(DATA_PATH)
     except: ds = load_dataset(DATA_PATH)
     real_train = [t for t in ds['train']['text'] if len(t.strip()) > 0][:TARGET_SAMPLES]
     real_valid = [t for t in ds['validation']['text'] if len(t.strip()) > 0][:]
 
-    # [Generation 0] 裁判模型与基线训练
-    os.makedirs("./rejection_results", exist_ok=True)
+    # [Generation 0] 
     if not os.path.exists(GEN0_ORACLE_PATH):
         print("\n>>> Training Generation 0 (Oracle) ...")
         train_model(real_train, tokenizer, GEN0_ORACLE_PATH)
@@ -306,7 +311,6 @@ def main():
     history = [{"generation": 0, "strategy": "real_data", "ppl": gen0_ppl}]
     print(f"\n>>> Gen 0 PPL (Anchor): {gen0_ppl:.2f}")
 
-    # 初始化采样器 (提取真实分布锚点)
     sampler = AdvancedRejectionSampler(GEN0_ORACLE_PATH, EMBEDDING_MODEL_PATH, DEVICE)
     sampler.setup_real_distribution(real_train)
 
@@ -319,7 +323,6 @@ def main():
     for gen in range(1, NUM_GENERATIONS + 1):
         print(f"\n" + "="*40 + f"\n Generation {gen} | Strategy: {args.strategy}\n" + "="*40)
         
-        # 1. 过量生成 (Oversampling)
         print(f" -> Generating {OVERSAMPLE_SIZE} candidate samples...")
         generator = GPT2LMHeadModel.from_pretrained(current_generator_dir).to(DEVICE).eval()
         generator.config.pad_token_id = tokenizer.pad_token_id
@@ -330,7 +333,7 @@ def main():
             batch = prompt_pool[i : i + GEN_BATCH_SIZE]
             inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=PROMPT_LEN_BASE).to(DEVICE)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                outputs = generator.generate(**inputs, max_new_tokens=128, do_sample=True, temperature=GEN_TEMPERATURE, top_p=0.95)
+                outputs = generator.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=GEN_TEMPERATURE, top_p=0.95)
             candidate_texts.extend(tokenizer.batch_decode(outputs, skip_special_tokens=True))
         
         tokenizer.padding_side = "right"
@@ -338,10 +341,9 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 2. 拒绝采样路由 (Rejection Pipeline)
+        # [核心] 运用新的正则化采样器
         selected_texts, stats = sampler.apply_sampling(candidate_texts, TARGET_SAMPLES, args.strategy)
 
-        # 3. 后续训练与评估
         gen_dir = os.path.join(EXP_DIR, f"gen_{gen}")
         print(f" -> Training Generation {gen} Student...")
         train_model(selected_texts, tokenizer, gen_dir)
