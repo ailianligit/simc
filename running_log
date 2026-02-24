@@ -8,4 +8,4 @@
 v4 reject_v2.sh 6000b_1_1 
 
 # reject sampling v3
-v7 reject_v3.sh 6000b_0_1 
+v9 reject_v3.sh 6000b_0_1 

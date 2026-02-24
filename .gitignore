@@ -10,6 +10,7 @@ gpt2_wikitext2/rejection_sampling_results_v3
 gpt2_wikitext2/rejection_sampling_results_v4
 gpt2_wikitext2/rejection_sampling_results_v5
 gpt2_wikitext2/rejection_sampling_results_v7
+gpt2_wikitext2/rejection_sampling_results_v9
 
 *.safetensors
 *.bin
