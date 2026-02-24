@@ -5,7 +5,7 @@
 # ==================================================
 
 # 1. 定义要遍历的策略数组
-STRATEGIES=('combined_dynamic' 'random_fixed' 'nll_only_fixed' 'entropy_only_fixed' 'nll_fbd_fixed''nll_entropy_fixed' 'combined_fixed' 'random_dynamic')
+STRATEGIES=('combined_dynamic' 'random_fixed' 'nll_only_fixed' 'entropy_only_fixed' 'nll_fbd_fixed' 'nll_entropy_fixed' 'combined_fixed' 'random_dynamic')
 
 # 定义你的 Python 脚本名称
 PYTHON_SCRIPT="/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_v3.py"
