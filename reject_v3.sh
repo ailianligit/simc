@@ -5,13 +5,13 @@
 # ==================================================
 
 # 1. 定义要遍历的策略数组
-STRATEGIES=("combined" "random" "nll_only" "fbd_only")
+STRATEGIES=("combined" "random" "nll_only" "fbd_only" "entropy_only")
 
 # 定义你的 Python 脚本名称
 PYTHON_SCRIPT="/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_v3.py"
 
 # 创建一个专门的日志目录，用来存放控制台输出
-LOG_DIR="experiment_logs"
+LOG_DIR="/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v7/experiment_logs"
 mkdir -p ${LOG_DIR}
 
 echo "=================================================="

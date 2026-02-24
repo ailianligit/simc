@@ -29,42 +29,32 @@ EMBEDDING_MODEL_PATH = "/home/ubuntu/data/model/all-mpnet-base-v2"
 GEN0_ORACLE_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
 
 # 实验规模设置
-TARGET_SAMPLES = 10000       # 每代实际用于训练的最终样本数
-OVERSAMPLE_FACTOR = 2       # 基础放大倍数 (初始生成 20000 条)
-NUM_GENERATIONS = 10         # 观测代数
-EPOCHS = 5                  # 每代微调轮数
-
-# [新增] 动态温度控制参数
-BASE_GEN_TEMP = 1.3         # 初始高温
-MAX_GEN_TEMP = 2.0          # 温度上限
+TARGET_SAMPLES = 5000        # 每代实际用于训练的最终样本数 (调小一点加速实验)
+OVERSAMPLE_FACTOR = 4        # 放大 4 倍 (初始生成 20000 条) 提供充足的方差池
+NUM_GENERATIONS = 10         
+EPOCHS = 4                  
 
 TRAIN_BATCH_SIZE = 32
 GRADIENT_ACCUMULATION = 1
 MAX_LENGTH = 1024
 PROMPT_LEN_BASE = 64
-GEN_BATCH_SIZE = 256
+GEN_BATCH_SIZE = 128
 
 # ==========================================
-# 1. 高阶评估器与采样器 (内存安全版)
+# 1. 核心评估器与采样器
 # ==========================================
 class AdvancedRejectionSampler:
-    def __init__(self, oracle_path, device='cuda'):
+    def __init__(self, oracle_path, tokenizer, device='cuda'):
         self.device = device
         self.oracle_path = oracle_path
+        self.tokenizer = tokenizer
         self.embed_model = None
         self.oracle_model = None
-        self.oracle_tokenizer = None
         self.nll_loss_fct = CrossEntropyLoss(reduction='none')
         
         # 真实数据的真值锚点
-        self.real_nll_mean = None
-        self.real_nll_std = None
         self.real_mu = None
         self.real_cov = None
-        
-        # [新增] 词汇多样性锚点
-        self.real_bi_ent_mean = None
-        self.real_bi_ent_std = None
 
     # --- 显存管理机制 ---
     def _load_embed(self):
@@ -80,16 +70,13 @@ class AdvancedRejectionSampler:
 
     def _load_oracle(self):
         if self.oracle_model is None:
-            self.oracle_tokenizer = GPT2Tokenizer.from_pretrained(self.oracle_path)
-            if self.oracle_tokenizer.pad_token is None:
-                self.oracle_tokenizer.pad_token = self.oracle_tokenizer.eos_token
             self.oracle_model = GPT2LMHeadModel.from_pretrained(self.oracle_path).to(self.device)
             self.oracle_model.eval()
 
     def _unload_oracle(self):
         if self.oracle_model is not None:
-            del self.oracle_model; del self.oracle_tokenizer
-            self.oracle_model = None; self.oracle_tokenizer = None
+            del self.oracle_model
+            self.oracle_model = None
             gc.collect(); torch.cuda.empty_cache()
 
     # --- 核心特征计算 ---
@@ -104,7 +91,7 @@ class AdvancedRejectionSampler:
         entropies = []
         for i in tqdm(range(0, len(texts), batch_size), desc="Scoring NLL", leave=False):
             batch = texts[i : i + batch_size]
-            inputs = self.oracle_tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
+            inputs = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.device)
             with torch.no_grad():
                 outputs = self.oracle_model(inputs.input_ids, attention_mask=inputs.attention_mask)
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
@@ -116,7 +103,6 @@ class AdvancedRejectionSampler:
         self._unload_oracle()
         return np.array(entropies)
 
-    # [新增] 单样本词汇多样性计算 (Bigram Entropy)
     @staticmethod
     def compute_single_bigram_entropy(text):
         tokens = text.strip().split()
@@ -131,101 +117,95 @@ class AdvancedRejectionSampler:
 
     @staticmethod
     def compute_fbd(mu1, sigma1, mu2, sigma2, eps=1e-6):
-        diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-        if not np.isfinite(covmean).all():
-            offset = np.eye(sigma1.shape[0]) * eps
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-        if np.iscomplexobj(covmean): covmean = covmean.real
-        return float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean))
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore") # 忽略 scipy 的弃用警告
+            diff = mu1 - mu2
+            covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+            if not np.isfinite(covmean).all():
+                offset = np.eye(sigma1.shape[0]) * eps
+                covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+            if np.iscomplexobj(covmean): covmean = covmean.real
+            return float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean))
 
     # --- 基线分布描绘 ---
     def profile_real_data(self, real_texts):
-        """建立绝对参照系：NLL、Bigram Entropy 及 MPNet 均值/方差"""
-        print("    | Profiling Reference Distributions...")
-        
-        nlls = self.get_oracle_nlls(real_texts)
-        self.real_nll_mean = np.mean(nlls)
-        self.real_nll_std = np.std(nlls)
-        
-        bi_ents = self.get_batch_bigram_entropy(real_texts)
-        self.real_bi_ent_mean = np.mean(bi_ents)
-        self.real_bi_ent_std = np.std(bi_ents)
-        
+        print("    | Profiling Reference Distributions for FBD...")
         embs = self.get_embeddings(real_texts)
         self.real_mu = np.mean(embs, axis=0)
         self.real_cov = np.cov(embs, rowvar=False)
-        
-        print(f"    | Real NLL Anchor: mu={self.real_nll_mean:.2f}, std={self.real_nll_std:.2f}")
-        print(f"    | Real Bigram Ent Anchor: mu={self.real_bi_ent_mean:.2f}, std={self.real_bi_ent_std:.2f}")
 
     # --- 最终策略调度 ---
     def execute_strategy(self, candidate_texts, strategy, target_size):
-        """执行拒绝采样"""
+        """核心拒绝采样：纯信息论与相对分布对齐"""
         print(f"    | Executing Strategy: [{strategy.upper()}] on {len(candidate_texts)} candidates")
         
+        # 0. 基线组
         if strategy == "random":
             return random.sample(candidate_texts, target_size), {}
             
-        # [修改] 阈值计算
-        nll_lower = self.real_nll_mean - 1.5 * self.real_nll_std
-        nll_upper = self.real_nll_mean + 2.0 * self.real_nll_std
-        
-        # [新增] 多样性下限：只允许比真实人类的平均多样性稍微低一点
-        bi_ent_lower = max(0.5, self.real_bi_ent_mean - 2.5 * self.real_bi_ent_std) 
+        nlls = self.get_oracle_nlls(candidate_texts)
+        bi_ents = self.get_batch_bigram_entropy(candidate_texts)
 
-        # 2. NLL_ONLY 
+        # 1. 消融组 A：仅控制通顺度 (淘汰最差的 15% NLL)
         if strategy == "nll_only":
-            nlls = self.get_oracle_nlls(candidate_texts)
-            valid_idx = np.where((nlls >= nll_lower) & (nlls <= nll_upper))[0]
-            if len(valid_idx) < target_size:
-                valid_idx = np.argsort(np.abs(nlls - self.real_nll_mean))[:target_size]
-            else:
-                valid_idx = np.random.choice(valid_idx, target_size, replace=False)
-            return [candidate_texts[i] for i in valid_idx], {"filtered_nll_mean": float(np.mean(nlls[valid_idx]))}
-            
-        # 3. FBD_ONLY
+            nll_thresh = np.quantile(nlls, 0.85) # 保留 NLL 较小的 85%
+            valid_idx = np.where(nlls <= nll_thresh)[0]
+            selected_idx = np.random.choice(valid_idx, target_size, replace=False)
+            return [candidate_texts[i] for i in selected_idx], {"filtered_nll_mean": float(np.mean(nlls[selected_idx]))}
+
+        # 2. 消融组 B：仅控制多样性 (保留 Entropy 最大的 85%)
+        if strategy == "entropy_only":
+            ent_thresh = np.quantile(bi_ents, 0.15) # 淘汰 Entropy 最小的 15%
+            valid_idx = np.where(bi_ents >= ent_thresh)[0]
+            selected_idx = np.random.choice(valid_idx, target_size, replace=False)
+            return [candidate_texts[i] for i in selected_idx], {"filtered_ent_mean": float(np.mean(bi_ents[selected_idx]))}
+
+        # 3. 消融组 C：仅宏观对齐 (不做任何微观截断，直接去拼凑高斯分布)
         if strategy == "fbd_only":
             embs_pool = self.get_embeddings(candidate_texts)
             best_idx, best_fbd = self._subset_search(embs_pool, np.arange(len(candidate_texts)), target_size)
             return [candidate_texts[i] for i in best_idx], {"best_fbd": best_fbd}
 
-        # 4. COMBINED (三重防御：V-Entropy + NLL + FBD)
+        # 4. 终极防御组 (COMBINED: 相对 NLL 截断 + 相对 Entropy 截断 + FBD 搜索)
         if strategy == "combined":
-            nlls = self.get_oracle_nlls(candidate_texts)
-            bi_ents = self.get_batch_bigram_entropy(candidate_texts)
+            # 步骤 1：去毒 (Denoising) - 淘汰绝对乱码
+            nll_thresh = np.quantile(nlls, 0.85) 
+            nll_passed = np.where(nlls <= nll_thresh)[0]
             
-            # [核心逻辑] 同时满足 NLL 边界 和 多样性下限
-            valid_idx = np.where(
-                (nlls >= nll_lower) & 
-                (nlls <= nll_upper) & 
-                (bi_ents >= bi_ent_lower)
-            )[0]
+            # 步骤 2：防同质化 (Anti-Mode-Collapse) - 淘汰车轱辘话
+            # 注意：是在 nll_passed 的幸存者里，计算熵的相对分位数
+            survivor_ents = bi_ents[nll_passed]
+            ent_thresh = np.quantile(survivor_ents, 0.20) # 淘汰剩下的里面最单调的 20%
             
-            pass_rate = len(valid_idx) / len(candidate_texts)
-            print(f"      -> Combined Filter Pass Rate: {pass_rate:.2%}")
+            final_pool_idx = nll_passed[np.where(survivor_ents >= ent_thresh)[0]]
+            final_pool_texts = [candidate_texts[i] for i in final_pool_idx]
             
-            # 动态反馈机制
-            if len(valid_idx) < target_size:
-                print(f"      [Warning] Combined filter left {len(valid_idx)} < {target_size}. Relaxing constraints...")
-                # 如果过滤太狠，放宽多样性约束，优先保证 NLL
-                valid_idx = np.where((nlls >= nll_lower) & (nlls <= nll_upper))[0]
-                if len(valid_idx) < target_size:
-                     valid_idx = np.argsort(np.abs(nlls - self.real_nll_mean))[:int(target_size*1.2)]
+            # 确保余量足够供 FBD 搜索
+            if len(final_pool_texts) < target_size:
+                print("      [Warning] Squeeze effect detected. Relaxing bounds.")
+                final_pool_texts = [candidate_texts[i] for i in nll_passed][:int(target_size*1.5)]
+                
+            print(f"      -> Filter Pool Size for FBD: {len(final_pool_texts)} / {len(candidate_texts)}")
+
+            # 步骤 3：宏观对齐 (Macro Alignment)
+            embs_pool = self.get_embeddings(final_pool_texts)
+            best_local_idx, best_fbd = self._subset_search(embs_pool, np.arange(len(final_pool_texts)), target_size)
             
-            # 在合法空间内，进行 FBD 匹配
-            valid_texts = [candidate_texts[i] for i in valid_idx]
-            embs_pool = self.get_embeddings(valid_texts)
-            best_local_idx, best_fbd = self._subset_search(embs_pool, np.arange(len(valid_texts)), target_size)
+            final_selected = [final_pool_texts[i] for i in best_local_idx]
             
-            final_selected = [valid_texts[i] for i in best_local_idx]
+            # 用于记录的数据
+            sel_nlls = self.get_oracle_nlls(final_selected, batch_size=64)
+            sel_ents = self.get_batch_bigram_entropy(final_selected)
+            
             return final_selected, {
                 "best_fbd": best_fbd, 
-                "combined_pass_rate": pass_rate,
-                "final_bi_ent_mean": float(np.mean(bi_ents[valid_idx][best_local_idx]))
+                "filtered_nll_mean": float(np.mean(sel_nlls)),
+                "filtered_ent_mean": float(np.mean(sel_ents))
             }
 
-    def _subset_search(self, embs_pool, search_indices, target_size, trials=15):
+    def _subset_search(self, embs_pool, search_indices, target_size, trials=25):
+        # 稍微增加搜索次数以应对扩大了的 OVERSAMPLE_FACTOR
         print(f"    | Running FBD Subset Search (Trials={trials})...")
         best_idx = None
         best_fbd = float('inf')
@@ -243,60 +223,41 @@ class AdvancedRejectionSampler:
 # ==========================================
 # 2. 训练、生成与评估脚手架
 # ==========================================
-
-# [新增] 评估当前模型的生成多样性
-def estimate_model_diversity(model, tokenizer, test_prompts):
-    """快速评估模型当前状态的内生多样性，用于动态温度调节"""
-    model.eval()
-    tokenizer.padding_side = "left"
-    inputs = tokenizer(test_prompts, return_tensors="pt", padding=True, truncation=True, max_length=PROMPT_LEN_BASE).to(DEVICE)
-    
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-        # 使用基础温度探测
-        outputs = model.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=1.0, pad_token_id=tokenizer.eos_token_id)
-        
-    texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    bi_ents = [AdvancedRejectionSampler.compute_single_bigram_entropy(t) for t in texts]
-    tokenizer.padding_side = "right"
-    return np.mean(bi_ents)
-
-def generate_pool_dynamic(model, tokenizer, prompt_pool, initial_size, strategy, sampler):
-    """基于多样性评估的动态温度生成机制"""
-    
-    # [核心优化] 动态温度注入
-    test_prompts = random.sample(prompt_pool, min(32, len(prompt_pool)))
-    current_diversity = estimate_model_diversity(model, tokenizer, test_prompts)
-    
-    # 距离真值越远，或者多样性本身越低，则越大幅度地提高生成温度
-    diversity_gap = sampler.real_bi_ent_mean - current_diversity
-    if diversity_gap > 0:
-        # 惩罚系数：差距越大，温度提得越高
-        adjusted_temp = min(MAX_GEN_TEMP, BASE_GEN_TEMP + (diversity_gap * 0.5))
-        print(f"    | [Auto-Temp] Model diversity degraded ({current_diversity:.2f} < {sampler.real_bi_ent_mean:.2f}). Boosting Temperature to {adjusted_temp:.2f}")
-    else:
-        adjusted_temp = BASE_GEN_TEMP
-        print(f"    | [Auto-Temp] Model diversity healthy. Using Base Temperature {adjusted_temp:.2f}")
-
+def generate_pool_dynamic(model, tokenizer, prompt_pool, initial_size, current_gen):
+    """代际温度退火注入方差"""
     model.eval()
     tokenizer.padding_side = "left"
     synthetic_texts = []
     
+    # [核心优化] 强制注入物理方差
+    # 随着代数加深，强迫模型使用更高的温度，并略微增加 repetition_penalty
+    forced_temp = min(2.0, 1.0 + (0.12 * current_gen)) 
+    rep_penalty = min(1.2, 1.0 + (0.02 * current_gen))
+
     batch_size = GEN_BATCH_SIZE
     prompts = (prompt_pool * (initial_size // len(prompt_pool) + 1))[:initial_size]
     
-    print(f"    | Generating Initial Pool ({initial_size} samples) at T={adjusted_temp:.2f}...")
+    print(f"    | Generating Initial Pool ({initial_size} samples) at T={forced_temp:.2f}, RepPen={rep_penalty:.2f}...")
     for i in tqdm(range(0, initial_size, batch_size), desc="Generating", leave=False):
         batch = prompts[i : i+batch_size]
         inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=PROMPT_LEN_BASE).to(DEVICE)
         try:
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-                outputs = model.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=adjusted_temp, top_p=0.95, pad_token_id=tokenizer.eos_token_id)
+                outputs = model.generate(
+                    **inputs, 
+                    max_new_tokens=150, 
+                    do_sample=True, 
+                    temperature=forced_temp, 
+                    repetition_penalty=rep_penalty,
+                    top_p=0.95, 
+                    pad_token_id=tokenizer.eos_token_id
+                )
             synthetic_texts.extend(tokenizer.batch_decode(outputs, skip_special_tokens=True))
         except RuntimeError:
             torch.cuda.empty_cache(); continue
             
     tokenizer.padding_side = "right"
-    return synthetic_texts, adjusted_temp
+    return synthetic_texts, forced_temp
 
 def group_texts(examples):
     concatenated = {k: sum(examples[k], []) for k in examples.keys()}
@@ -347,11 +308,12 @@ def compute_validation_ppl(model_dir, tokenizer, valid_texts):
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--strategy", type=str, choices=['random', 'nll_only', 'fbd_only', 'combined'], required=True)
+    # [优化] 加入了 entropy_only 实验组
+    parser.add_argument("--strategy", type=str, choices=['random', 'nll_only', 'entropy_only', 'fbd_only', 'combined'], required=True)
     args = parser.parse_args()
     
     random.seed(42); np.random.seed(42); torch.manual_seed(42)
-    EXP_ROOT = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v5/exp_{args.strategy}"
+    EXP_ROOT = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v7/exp_{args.strategy}"
     os.makedirs(EXP_ROOT, exist_ok=True)
     metrics_log_path = os.path.join(EXP_ROOT, "metrics.json")
     
@@ -363,7 +325,7 @@ def main():
     except: dataset = load_dataset(DATA_PATH)
     
     real_texts = [t for t in dataset['train']['text'] if len(t.strip()) > 0][:TARGET_SAMPLES * 2]
-    valid_texts = [t for t in dataset['validation']['text'] if len(t.strip()) > 0][:]
+    valid_texts = [t for t in dataset['validation']['text'] if len(t.strip()) > 0][:] # 略微缩减验证集提速
 
     # [Gen 0: Oracle & Reference]
     gen0_dir = GEN0_ORACLE_PATH
@@ -371,7 +333,7 @@ def main():
         print(">>> Training Gen 0 Baseline (Oracle)...")
         train_student(random.sample(real_texts, TARGET_SAMPLES), tokenizer, gen0_dir)
         
-    sampler = AdvancedRejectionSampler(oracle_path=gen0_dir, device=DEVICE)
+    sampler = AdvancedRejectionSampler(oracle_path=gen0_dir, tokenizer=tokenizer, device=DEVICE)
     sampler.profile_real_data(random.sample(real_texts, TARGET_SAMPLES))
     
     gen0_ppl = compute_validation_ppl(gen0_dir, tokenizer, valid_texts)
@@ -385,15 +347,15 @@ def main():
         print(f"\n{'='*20} Generation {gen} {'='*20}")
         gen_dir = os.path.join(EXP_ROOT, f"gen_{gen}")
         
-        # 1. 生成大池子 (加入动态温度)
+        # 1. 生成大池子 (强行退火加温)
         generator = GPT2LMHeadModel.from_pretrained(current_generator_dir).to(DEVICE)
         generator.config.pad_token_id = tokenizer.pad_token_id
         pool_texts, used_temp = generate_pool_dynamic(
-            generator, tokenizer, real_texts[:TARGET_SAMPLES], TARGET_SAMPLES * OVERSAMPLE_FACTOR, args.strategy, sampler
+            generator, tokenizer, real_texts[:TARGET_SAMPLES], TARGET_SAMPLES * OVERSAMPLE_FACTOR, current_gen=gen
         )
         del generator; gc.collect(); torch.cuda.empty_cache()
         
-        # 2. 拒绝采样执行 (加入 V-Entropy 硬截断)
+        # 2. 拒绝采样执行 (相对截断设计)
         selected_texts, stats = sampler.execute_strategy(pool_texts, args.strategy, TARGET_SAMPLES)
         
         # 3. 训练最新后代
