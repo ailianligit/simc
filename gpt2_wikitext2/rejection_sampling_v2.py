@@ -254,9 +254,14 @@ def train_model(texts, tokenizer, output_dir):
         
     packed = tok_ds.map(group_texts, batched=True)
     args = TrainingArguments(
-        output_dir=output_dir, overwrite_output_dir=True, num_train_epochs=EPOCHS,
-        per_device_train_batch_size=TRAIN_BATCH_SIZE, gradient_accumulation_steps=GRADIENT_ACCUMULATION,
-        learning_rate=5e-5, optim="adamw_torch_fused", save_strategy="no", report_to="none"
+        output_dir=output_dir, 
+        num_train_epochs=EPOCHS,
+        per_device_train_batch_size=TRAIN_BATCH_SIZE, 
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION,
+        learning_rate=5e-5, 
+        optim="adamw_torch_fused", 
+        save_strategy="no", 
+        report_to="none"
     )
     trainer = Trainer(model=model, args=args, train_dataset=packed, data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False))
     trainer.train()
