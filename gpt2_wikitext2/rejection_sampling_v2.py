@@ -9,6 +9,10 @@ import pandas as pd
 from tqdm import tqdm
 from scipy import linalg
 from collections import Counter
+import warnings
+
+# [新增] 引入用于宏观密度配额重采样的 KMeans
+from sklearn.cluster import MiniBatchKMeans
 
 import torch
 from torch.nn import CrossEntropyLoss
@@ -17,6 +21,9 @@ from sentence_transformers import SentenceTransformer
 from transformers import (
     GPT2LMHeadModel, GPT2Tokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 )
+
+# 忽略聚类时的常见无害警告
+warnings.filterwarnings('ignore', category=UserWarning)
 
 # ==========================================
 # 0. 全局配置与路径
@@ -33,16 +40,16 @@ GEN0_ORACLE_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
 NUM_GENERATIONS = 10
 EPOCHS = 5
 TARGET_SAMPLES = 10000       # 最终用于训练的精选数据量
-OVERSAMPLE_RATIO = 2.0       # 候选池放大倍数 (生成 20000 条供筛选)
+OVERSAMPLE_RATIO = 2.0      # 候选池放大倍数 (生成 20000 条供筛选)
 
-GEN_BATCH_SIZE = 256
-TRAIN_BATCH_SIZE = 32
-GRADIENT_ACCUMULATION = 1
-GEN_TEMPERATURE = 1.3        # 较高温度，注入必要方差
+GEN_BATCH_SIZE = 128
+TRAIN_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION = 2
+GEN_TEMPERATURE = 1.3       # 较高温度，注入必要方差
 PROMPT_LEN_BASE = 64
 
 # ==========================================
-# 1. 核心评估与采样器
+# 1. 核心评估与采样器 (终极版)
 # ==========================================
 class AdvancedRejectionSampler:
     def __init__(self, oracle_path, embed_path, device='cuda'):
@@ -54,9 +61,10 @@ class AdvancedRejectionSampler:
         self.embed_model = None
         self.nll_loss_fct = CrossEntropyLoss(reduction='none')
         
-        # 缓存真实数据的宏观分布特征
-        self.real_mu = None
-        self.real_cov = None
+        # [核心优化] 使用 KMeans 聚类锚点替代不稳定的 FBD 协方差计算
+        self.kmeans = None
+        self.real_cluster_proportions = None
+        self.NUM_CLUSTERS = 100 # 将语义空间划分为 100 个特征簇
 
     # --- 模型显存管理 ---
     def _load_oracle(self):
@@ -90,6 +98,7 @@ class AdvancedRejectionSampler:
             gc.collect()
             torch.cuda.empty_cache()
 
+    # --- 特征提取计算 ---
     def get_batch_oracle_nll(self, texts, batch_size=32):
         self._load_oracle()
         nlls = []
@@ -114,22 +123,20 @@ class AdvancedRejectionSampler:
         self._unload_embedder()
         return embs
 
-    @staticmethod
-    def compute_fbd(mu1, sigma1, mu2, sigma2, eps=1e-6):
-        diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-        if np.iscomplexobj(covmean): covmean = covmean.real
-        if not np.isfinite(covmean).all():
-            offset = np.eye(sigma1.shape[0]) * eps
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-        return float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean))
-
     def setup_real_distribution(self, real_texts):
-        """预先计算真实数据的均值和协方差作为参考锚点"""
-        print(">>> Profiling Real Data Macro Distribution...")
+        """[核心重构] 预先将真实数据划分为 K 个特征簇，建立真实分布的定距锚点"""
+        print(f">>> Profiling Real Data Macro Distribution (K-Means K={self.NUM_CLUSTERS})...")
         embs = self.get_embeddings(real_texts)
-        self.real_mu = np.mean(embs, axis=0)
-        self.real_cov = np.cov(embs, rowvar=False)
+        
+        # 训练轻量级的 K-Means
+        self.kmeans = MiniBatchKMeans(n_clusters=self.NUM_CLUSTERS, random_state=42, batch_size=256)
+        self.kmeans.fit(embs)
+        
+        # 统计真实数据在每个簇的占比
+        labels = self.kmeans.labels_
+        counts = Counter(labels)
+        total = len(labels)
+        self.real_cluster_proportions = {cluster: count / total for cluster, count in counts.items()}
 
     # --- 核心流水线 ---
     def apply_sampling(self, candidate_texts, target_size, strategy):
@@ -148,11 +155,10 @@ class AdvancedRejectionSampler:
             print("    | Running Dynamic Micro-Level Profiling...")
             df['nll'] = self.get_batch_oracle_nll(candidate_texts)
             
-            # [改进点 1&2]: 移除 Entropy 下限，改用 NLL 的动态相对阈值
+            # 动态相对阈值：剔除当前代最差的幻觉样本 (NLL 过高)
             nll_mean = df['nll'].mean()
             nll_std = df['nll'].std()
-            # 只砍掉当前代最差的那些幻觉样本 (NLL 过高)
-            dynamic_thresh = nll_mean + 1.5 * nll_std
+            dynamic_thresh = nll_mean + 1.2 * nll_std # 稍微收紧一点，保证进入宏观池的数据质量
             
             valid_df = df[df['nll'] <= dynamic_thresh].copy()
             print(f"    | Dynamic NLL Cutoff: {dynamic_thresh:.2f} (Kept {len(valid_df)}/{len(df)})")
@@ -173,55 +179,60 @@ class AdvancedRejectionSampler:
             return final_df['text'].tolist(), {"nll_mean": final_df['nll'].mean()}
 
         # ==========================================
-        # 阶段 B: 正则化 FBD 宏观搜索 (Regularized FBD)
+        # 阶段 B: [核心重构] 基于真实锚点的“配额削减”
+        # 彻底取代低效的随机 FBD 搜索，消除维度诅咒
         # ==========================================
         if strategy in ["macro_only", "combined"]:
-            print("    | Running Macro-Level Regularized FBD Search...")
+            print("    | Running Macro-Level Density Rebalancing (Quota Undersampling)...")
             pool_texts = candidate_df['text'].tolist()
             pool_embs = self.get_embeddings(pool_texts)
             
-            # 如果是 combined，我们需要知道每个样本的 NLL 来计算惩罚项
-            # 如果是 macro_only，我们只关心 FBD，不惩罚 NLL
-            if strategy == "combined":
-                pool_nlls = candidate_df['nll'].values
+            # 将生成的样本映射到真实特征簇中
+            cand_labels = self.kmeans.predict(pool_embs)
+            candidate_df['cluster'] = cand_labels
             
-            best_idx = None
-            best_score = float('inf')
-            best_raw_fbd = 0
-            num_trials = 20 # 蒙特卡洛搜索次数
+            selected_indices = []
             
-            # [改进点 3]: NLL 惩罚系数 (Lambda)
-            # FBD 通常在 0.05 ~ 0.3 之间，NLL 通常在 3.0 ~ 5.0 之间
-            # 我们希望 NLL 每增加 0.1，就相当于 FBD 恶化了 0.05，因此 lambda 设为 0.5 较为合理
-            LAMBDA_NLL = 0.5 
-            
-            for _ in tqdm(range(num_trials), desc="    | Searching Subsets", leave=False):
-                subset_idx = np.random.choice(len(pool_embs), target_size, replace=False)
-                sub_embs = pool_embs[subset_idx]
-                sub_mu = np.mean(sub_embs, axis=0)
-                sub_cov = np.cov(sub_embs, rowvar=False)
+            # 对每一个簇，按照真实数据的比例计算“名额” (Quota)
+            for cluster_id in range(self.NUM_CLUSTERS):
+                target_quota = int(target_size * self.real_cluster_proportions.get(cluster_id, 0))
+                cluster_candidates = candidate_df[candidate_df['cluster'] == cluster_id]
                 
-                raw_fbd = self.compute_fbd(self.real_mu, self.real_cov, sub_mu, sub_cov)
-                
-                if strategy == "combined":
-                    subset_mean_nll = np.mean(pool_nlls[subset_idx])
-                    # 正则化打分公式：FBD 越低越好，均值 NLL 越低越好
-                    current_score = raw_fbd + LAMBDA_NLL * subset_mean_nll
-                else:
-                    current_score = raw_fbd # macro_only 退化为只看 FBD
-                
-                if current_score < best_score:
-                    best_score = current_score
-                    best_raw_fbd = raw_fbd
-                    best_idx = subset_idx
+                if len(cluster_candidates) == 0:
+                    continue # 模式彻底丢失 (Type II error)，无法挽回
                     
-            selected_texts = [pool_texts[i] for i in best_idx]
-            
-            stats = {"fbd_score": best_raw_fbd, "combined_score": best_score}
-            if strategy == "combined":
-                stats["nll_mean"] = candidate_df.iloc[best_idx]['nll'].mean()
+                if len(cluster_candidates) > target_quota:
+                    # 发生 Mode Collapse (过度拥挤)：强制下采样，随机丢弃多余的！
+                    sampled = cluster_candidates.sample(n=target_quota, random_state=42)
+                else:
+                    # 稀疏区：未达配额，全部保留 (甚至可以考虑过采样)
+                    sampled = cluster_candidates
+                    
+                selected_indices.extend(sampled.index.tolist())
                 
-            return selected_texts, stats
+            selected_df = candidate_df.loc[selected_indices]
+            
+            # 最后数量对齐补齐
+            if len(selected_df) < target_size:
+                print(f"    | [Info] Strict quota resulted in {len(selected_df)} samples. Padding with remaining valid samples.")
+                missing = target_size - len(selected_df)
+                remaining_df = candidate_df.drop(selected_df.index)
+                
+                # 如果是 Combined 策略，优先用微观 NLL 好的样本补齐不足的配额
+                if strategy == "combined" and len(remaining_df) >= missing:
+                    pad_df = remaining_df.nsmallest(missing, 'nll')
+                else:
+                    pad_df = remaining_df.sample(min(missing, len(remaining_df)), random_state=42)
+                    
+                selected_df = pd.concat([selected_df, pad_df])
+            elif len(selected_df) > target_size:
+                selected_df = selected_df.sample(target_size, random_state=42)
+
+            stats = {"retained_clusters": selected_df['cluster'].nunique()}
+            if strategy == "combined":
+                stats["nll_mean"] = selected_df['nll'].mean()
+                
+            return selected_df['text'].tolist(), stats
 
 # ==========================================
 # 2. 训练与生成工具
@@ -262,7 +273,7 @@ def evaluate_ppl(model_dir, tokenizer, valid_texts):
     seq_len = encodings.input_ids.size(1)
     nlls = []
     prev_end_loc = 0
-    for begin_loc in range(0, min(seq_len, 50000), stride):
+    for begin_loc in range(0, seq_len, stride):
         end_loc = min(begin_loc + 1024, seq_len)
         trg_len = end_loc - prev_end_loc
         input_ids = encodings.input_ids[:, begin_loc:end_loc].to(DEVICE)
@@ -290,7 +301,7 @@ def main():
     np.random.seed(42)
     torch.manual_seed(42)
 
-    EXP_DIR = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v4/exp_{args.strategy}"
+    EXP_DIR = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v6/exp_{args.strategy}"
     os.makedirs(EXP_DIR, exist_ok=True)
     metrics_log = os.path.join(EXP_DIR, "metrics.json")
     
@@ -341,7 +352,7 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        # [核心] 运用新的正则化采样器
+        # [核心] 运用新的确定性聚类配额采样器
         selected_texts, stats = sampler.apply_sampling(candidate_texts, TARGET_SAMPLES, args.strategy)
 
         gen_dir = os.path.join(EXP_DIR, f"gen_{gen}")
