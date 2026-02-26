@@ -11,8 +11,8 @@ gpt2_wikitext2/rejection_sampling_results_v4
 gpt2_wikitext2/rejection_sampling_results_v5
 gpt2_wikitext2/rejection_sampling_results_v6
 gpt2_wikitext2/rejection_sampling_results_v7
+gpt2_wikitext2/rejection_sampling_results_v8
 gpt2_wikitext2/rejection_sampling_results_v9
-rejection_sampling_results_v9
 
 *.safetensors
 *.bin

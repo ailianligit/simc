@@ -5,6 +5,7 @@
 # reject sampling v1
 
 # reject sampling v2
-v6 6000b_1_1 "macro_only"
+v8 6000b_0_1 "combined" "baseline"
+v8 6000b_1_1 "micro_only" "macro_only"
 
 # reject sampling v3

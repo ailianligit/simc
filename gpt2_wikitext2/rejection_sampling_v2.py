@@ -7,11 +7,10 @@ import argparse
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from scipy import linalg
 from collections import Counter
 import warnings
 
-# [新增] 引入用于宏观密度配额重采样的 KMeans
+# 引入用于宏观密度配额重采样的 KMeans
 from sklearn.cluster import MiniBatchKMeans
 
 import torch
@@ -29,6 +28,10 @@ warnings.filterwarnings('ignore', category=UserWarning)
 # 0. 全局配置与路径
 # ==========================================
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# [新增] 强制限制底层 C++ 库的线程数，防止与 PyTorch 抢占资源导致死锁或崩溃
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 DATA_PATH = "/home/ubuntu/data/dataset/wikitext_dataset"
@@ -40,16 +43,16 @@ GEN0_ORACLE_PATH = "/home/ubuntu/data/simc/gpt2_wikitext2/model_real_trained"
 NUM_GENERATIONS = 10
 EPOCHS = 5
 TARGET_SAMPLES = 10000       # 最终用于训练的精选数据量
-OVERSAMPLE_RATIO = 2.0      # 候选池放大倍数 (生成 20000 条供筛选)
+OVERSAMPLE_RATIO = 3.0       # 候选池放大倍数 (生成 20000 条供筛选)
 
 GEN_BATCH_SIZE = 256
 TRAIN_BATCH_SIZE = 32
 GRADIENT_ACCUMULATION = 1
-GEN_TEMPERATURE = 1.3       # 较高温度，注入必要方差
+GEN_TEMPERATURE = 1.3        # 较高温度，注入必要方差
 PROMPT_LEN_BASE = 64
 
 # ==========================================
-# 1. 核心评估与采样器 (终极版)
+# 1. 核心评估与采样器 (Cluster-First 架构)
 # ==========================================
 class AdvancedRejectionSampler:
     def __init__(self, oracle_path, embed_path, device='cuda'):
@@ -61,7 +64,6 @@ class AdvancedRejectionSampler:
         self.embed_model = None
         self.nll_loss_fct = CrossEntropyLoss(reduction='none')
         
-        # [核心优化] 使用 KMeans 聚类锚点替代不稳定的 FBD 协方差计算
         self.kmeans = None
         self.real_cluster_proportions = None
         self.NUM_CLUSTERS = 100 # 将语义空间划分为 100 个特征簇
@@ -124,21 +126,19 @@ class AdvancedRejectionSampler:
         return embs
 
     def setup_real_distribution(self, real_texts):
-        """[核心重构] 预先将真实数据划分为 K 个特征簇，建立真实分布的定距锚点"""
+        """预先将真实数据划分为 K 个特征簇，建立真实分布的定距锚点"""
         print(f">>> Profiling Real Data Macro Distribution (K-Means K={self.NUM_CLUSTERS})...")
         embs = self.get_embeddings(real_texts)
         
-        # 训练轻量级的 K-Means
         self.kmeans = MiniBatchKMeans(n_clusters=self.NUM_CLUSTERS, random_state=42, batch_size=256)
         self.kmeans.fit(embs)
         
-        # 统计真实数据在每个簇的占比
         labels = self.kmeans.labels_
         counts = Counter(labels)
         total = len(labels)
         self.real_cluster_proportions = {cluster: count / total for cluster, count in counts.items()}
 
-    # --- 核心流水线 ---
+    # --- 核心流水线 (重构的 Cluster-First 逻辑) ---
     def apply_sampling(self, candidate_texts, target_size, strategy):
         print(f"\n>>> Applying Strategy: [{strategy.upper()}]")
         
@@ -148,91 +148,97 @@ class AdvancedRejectionSampler:
 
         df = pd.DataFrame({"text": candidate_texts})
 
-        # ==========================================
-        # 阶段 A: 微观动态截断 (Fluency First 硬安检)
-        # ==========================================
+        # === 阶段 1: 全局特征提取 ===
+        # 不再做全局硬截断，而是准备好武器 (NLL和Cluster)，留到簇内去打仗
+        print("    | Extracting Global Features (NLL & Embeddings)...")
         if strategy in ["micro_only", "combined"]:
-            print("    | Running Dynamic Micro-Level Profiling...")
             df['nll'] = self.get_batch_oracle_nll(candidate_texts)
             
-            # 动态相对阈值：剔除当前代最差的幻觉样本 (NLL 过高)
-            nll_mean = df['nll'].mean()
-            nll_std = df['nll'].std()
-            dynamic_thresh = nll_mean + 1.2 * nll_std # 稍微收紧一点，保证进入宏观池的数据质量
-            
-            valid_df = df[df['nll'] <= dynamic_thresh].copy()
-            print(f"    | Dynamic NLL Cutoff: {dynamic_thresh:.2f} (Kept {len(valid_df)}/{len(df)})")
+        if strategy in ["macro_only", "combined"]:
+            pool_embs = self.get_embeddings(candidate_texts)
+            df['cluster'] = self.kmeans.predict(pool_embs)
+
+        # === 阶段 2: 路由分发 ===
+        if strategy == "micro_only":
+            # 纯微观：老规矩，动态剔除全局最差的，然后随机抽
+            nll_mean, nll_std = df['nll'].mean(), df['nll'].std()
+            dynamic_thresh = nll_mean + 1.2 * nll_std
+            valid_df = df[df['nll'] <= dynamic_thresh]
             
             if len(valid_df) < target_size:
-                print("    | [Warning] Valid pool too small. Padding with best remaining NLL.")
-                missing = target_size - len(valid_df)
-                remaining = df.drop(valid_df.index).copy()
-                pad_df = remaining.nsmallest(missing, 'nll')
-                candidate_df = pd.concat([valid_df, pad_df])
+                final_df = df.nsmallest(target_size, 'nll')
             else:
-                candidate_df = valid_df
-        else:
-            candidate_df = df # macro_only 不做微观过滤
-
-        if strategy == "micro_only":
-            final_df = candidate_df.sample(target_size, random_state=42)
+                final_df = valid_df.sample(target_size, random_state=42)
+                
             return final_df['text'].tolist(), {"nll_mean": final_df['nll'].mean()}
 
-        # ==========================================
-        # 阶段 B: [核心重构] 基于真实锚点的“配额削减”
-        # 彻底取代低效的随机 FBD 搜索，消除维度诅咒
-        # ==========================================
-        if strategy in ["macro_only", "combined"]:
-            print("    | Running Macro-Level Density Rebalancing (Quota Undersampling)...")
-            pool_texts = candidate_df['text'].tolist()
-            pool_embs = self.get_embeddings(pool_texts)
-            
-            # 将生成的样本映射到真实特征簇中
-            cand_labels = self.kmeans.predict(pool_embs)
-            candidate_df['cluster'] = cand_labels
-            
+        elif strategy == "macro_only":
+            # 纯宏观：按照配额盲抽，不管通顺度
             selected_indices = []
-            
-            # 对每一个簇，按照真实数据的比例计算“名额” (Quota)
             for cluster_id in range(self.NUM_CLUSTERS):
                 target_quota = int(target_size * self.real_cluster_proportions.get(cluster_id, 0))
-                cluster_candidates = candidate_df[candidate_df['cluster'] == cluster_id]
+                cluster_candidates = df[df['cluster'] == cluster_id]
                 
-                if len(cluster_candidates) == 0:
-                    continue # 模式彻底丢失 (Type II error)，无法挽回
-                    
                 if len(cluster_candidates) > target_quota:
-                    # 发生 Mode Collapse (过度拥挤)：强制下采样，随机丢弃多余的！
                     sampled = cluster_candidates.sample(n=target_quota, random_state=42)
+                elif len(cluster_candidates) > 0:
+                    # 数量不足，直接复制填满 (Oversampling)
+                    sampled = cluster_candidates.sample(n=target_quota, replace=True, random_state=42)
                 else:
-                    # 稀疏区：未达配额，全部保留 (甚至可以考虑过采样)
-                    sampled = cluster_candidates
-                    
+                    continue
                 selected_indices.extend(sampled.index.tolist())
                 
-            selected_df = candidate_df.loc[selected_indices]
-            
-            # 最后数量对齐补齐
-            if len(selected_df) < target_size:
-                print(f"    | [Info] Strict quota resulted in {len(selected_df)} samples. Padding with remaining valid samples.")
-                missing = target_size - len(selected_df)
-                remaining_df = candidate_df.drop(selected_df.index)
+            final_df = df.loc[selected_indices]
+            if len(final_df) > target_size: final_df = final_df.sample(target_size, random_state=42)
+            elif len(final_df) < target_size:
+                missing = target_size - len(final_df)
+                final_df = pd.concat([final_df, df.sample(missing, random_state=42)])
                 
-                # 如果是 Combined 策略，优先用微观 NLL 好的样本补齐不足的配额
-                if strategy == "combined" and len(remaining_df) >= missing:
-                    pad_df = remaining_df.nsmallest(missing, 'nll')
-                else:
-                    pad_df = remaining_df.sample(min(missing, len(remaining_df)), random_state=42)
-                    
-                selected_df = pd.concat([selected_df, pad_df])
-            elif len(selected_df) > target_size:
-                selected_df = selected_df.sample(target_size, random_state=42)
+            return final_df['text'].tolist(), {"retained_clusters": final_df['cluster'].nunique()}
 
-            stats = {"retained_clusters": selected_df['cluster'].nunique()}
-            if strategy == "combined":
-                stats["nll_mean"] = selected_df['nll'].mean()
+        elif strategy == "combined":
+            # 终极形态：簇内局部安检 (Intra-Cluster NLL Sorting)
+            print("    | Running Intra-Cluster Density Rebalancing & NLL Sorting...")
+            selected_df_list = []
+            
+            for cluster_id in range(self.NUM_CLUSTERS):
+                target_quota = int(target_size * self.real_cluster_proportions.get(cluster_id, 0))
+                if target_quota == 0: continue
                 
-            return selected_df['text'].tolist(), stats
+                cluster_df = df[df['cluster'] == cluster_id]
+                
+                if len(cluster_df) == 0:
+                    continue # 模式彻底丢失
+                
+                if len(cluster_df) >= target_quota:
+                    # 【核心】优中选优：在拥挤簇里，挑选最像人话的 (NLL最低的) 留下，丢弃乱码
+                    sampled = cluster_df.nsmallest(target_quota, 'nll')
+                else:
+                    # 【核心】长尾保护：在稀疏簇里，直接复制质量最好的几个样本续命，直到填满配额
+                    # 先对剩下的少数样本排序，保证复制的是相对较好的
+                    sorted_minority = cluster_df.sort_values(by='nll')
+                    # 允许有放回抽样，相当于根据 NLL 隐式地给予了复制权重
+                    sampled = sorted_minority.sample(n=target_quota, replace=True, random_state=42)
+                    
+                selected_df_list.append(sampled)
+                
+            final_df = pd.concat(selected_df_list)
+            
+            # 精确对齐到 target_size
+            if len(final_df) > target_size:
+                final_df = final_df.sample(target_size, random_state=42)
+            elif len(final_df) < target_size:
+                # 差几条配额，用全局最通顺的补齐
+                missing = target_size - len(final_df)
+                remaining_df = df.drop(final_df.index)
+                pad_df = remaining_df.nsmallest(missing, 'nll')
+                final_df = pd.concat([final_df, pad_df])
+                
+            stats = {
+                "retained_clusters": final_df['cluster'].nunique(),
+                "nll_mean": final_df['nll'].mean()
+            }
+            return final_df['text'].tolist(), stats
 
 # ==========================================
 # 2. 训练与生成工具
@@ -306,7 +312,8 @@ def main():
     np.random.seed(42)
     torch.manual_seed(42)
 
-    EXP_DIR = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v6/exp_{args.strategy}"
+    # 保存路径调整
+    EXP_DIR = f"/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_results_v8/exp_{args.strategy}"
     os.makedirs(EXP_DIR, exist_ok=True)
     metrics_log = os.path.join(EXP_DIR, "metrics.json")
     
@@ -357,7 +364,7 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        # [核心] 运用新的确定性聚类配额采样器
+        # [核心] 应用最终版的簇内安检采样器
         selected_texts, stats = sampler.apply_sampling(candidate_texts, TARGET_SAMPLES, args.strategy)
 
         gen_dir = os.path.join(EXP_DIR, f"gen_{gen}")
