@@ -5,8 +5,8 @@
 # ==================================================
 
 # 1. 定义成对的策略配置
-TEMP_STRATEGIES=('dynamic' 'dynamic')
-FILTER_STRATEGIES=('nll_fbd' 'fbd_only')
+TEMP_STRATEGIES=('dynamic' 'dynamic' 'fixed')
+FILTER_STRATEGIES=('nll_fbd' 'fbd_only' 'fbd_only')
 
 # 确保脚本路径正确 (建议使用双引号包裹路径)
 PYTHON_SCRIPT="/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_v3.py" 

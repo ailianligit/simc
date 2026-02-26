@@ -4,6 +4,21 @@
 # 自动化运行 Model Collapse 消融实验套件
 # ==================================================
 
+# ==========================================
+# [新增] 操作系统级：强制禁用所有底层库的多线程并发，彻底根除死锁与 Loky 信号量泄漏！
+# ==========================================
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+# 专门针对报错日志里的 loky 信号量泄漏：强制 joblib/scikit-learn 只用单核
+export LOKY_MAX_CPU_COUNT=1 
+export TOKENIZERS_PARALLELISM=false
+
+# 设置遇到错误时立即退出
+set -e
+
 # 1. 定义要遍历的策略数组
 STRATEGIES=("micro_only" "macro_only")
 

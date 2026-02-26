@@ -45,9 +45,9 @@ EPOCHS = 5
 TARGET_SAMPLES = 10000       # 最终用于训练的精选数据量
 OVERSAMPLE_RATIO = 3.0       # 候选池放大倍数 (生成 20000 条供筛选)
 
-GEN_BATCH_SIZE = 256
-TRAIN_BATCH_SIZE = 32
-GRADIENT_ACCUMULATION = 1
+GEN_BATCH_SIZE = 128
+TRAIN_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION = 2
 GEN_TEMPERATURE = 1.3        # 较高温度，注入必要方差
 PROMPT_LEN_BASE = 64
 
@@ -119,7 +119,7 @@ class AdvancedRejectionSampler:
         self._unload_oracle()
         return nlls
 
-    def get_embeddings(self, texts, batch_size=128):
+    def get_embeddings(self, texts, batch_size=32):
         self._load_embedder()
         embs = self.embed_model.encode(texts, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
         self._unload_embedder()
