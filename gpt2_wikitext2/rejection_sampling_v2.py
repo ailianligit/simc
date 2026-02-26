@@ -119,7 +119,7 @@ class AdvancedRejectionSampler:
         self._unload_oracle()
         return nlls
 
-    def get_embeddings(self, texts, batch_size=32):
+    def get_embeddings(self, texts, batch_size=128):
         self._load_embedder()
         embs = self.embed_model.encode(texts, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
         self._unload_embedder()
