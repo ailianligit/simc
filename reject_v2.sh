@@ -20,7 +20,7 @@ export TOKENIZERS_PARALLELISM=false
 set -e
 
 # 1. 定义要遍历的策略数组
-STRATEGIES=("combined" "baseline")
+STRATEGIES=("combined" "baseline" "micro_only" "macro_only")
 
 # 定义你的 Python 脚本名称
 PYTHON_SCRIPT="/home/ubuntu/data/simc/gpt2_wikitext2/rejection_sampling_v2.py"

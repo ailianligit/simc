@@ -32,11 +32,11 @@ OVERSAMPLE_FACTOR = 3
 NUM_GENERATIONS = 10
 EPOCHS = 5
 
-TRAIN_BATCH_SIZE = 8
-GRADIENT_ACCUMULATION = 2
+TRAIN_BATCH_SIZE = 32
+GRADIENT_ACCUMULATION = 1
 MAX_LENGTH = 1024
 PROMPT_LEN_BASE = 64
-GEN_BATCH_SIZE = 128
+GEN_BATCH_SIZE = 256
 
 # ==========================================
 # 1. 核心评估器与采样器 (解耦 Filter 逻辑)
@@ -58,7 +58,7 @@ class AdvancedRejectionSampler:
     def _load_embed(self):
         if self.embed_model is None:
             self.embed_model = SentenceTransformer(EMBEDDING_MODEL_PATH, device=self.device)
-            self.embed_model.max_seq_length = 512
+            # self.embed_model.max_seq_length = 512
             self.embed_model.eval()
 
     def _unload_embed(self):
@@ -78,7 +78,7 @@ class AdvancedRejectionSampler:
             gc.collect()
             torch.cuda.empty_cache()
 
-    def get_embeddings(self, texts, batch_size=32):
+    def get_embeddings(self, texts, batch_size=128):
         self._load_embed()
         embs = self.embed_model.encode(texts, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
         self._unload_embed()
